@@ -1,91 +1,11 @@
-Threat Intelligence 기반 자동 IOC 분석 파이프라인 (Security Threat Intel Fusion Pipeline)
+# Threat Intelligence 기반 IOC 매칭 및 위협 점수화 파이프라인
 
-> **목표:**  
-> 다양한 Threat Intelligence(IOC) 정보를 통합해서,  
-> **보안 로그와 자동 매칭 → IP 단위 위협 점수화 → 고위험 IP 리포트 생성**  
-> 까지 한 번에 수행하는 파이프라인입니다.
+이 프로젝트는 보안 로그를 단순히 저장하거나 조회하는 수준을 넘어서, **Threat Intelligence(IOC 정보)** 와 실제 로그를 연결해 “어떤 IP가 얼마나 위협적인지”를 정량적으로 평가하는 흐름을 한 번에 구현한 작업입니다. 구조는 단순하지만, 보안 관제(SOC)에서 실제로 쓰는 사고 방식을 그대로 옮겨 온 형태입니다. 기본 아이디어는 *“외부에서 악성으로 알려진 IP 정보(IoC)를 모아 정리한 뒤, 실제 로그와 매칭해서 위험도를 점수로 산출한다”*입니다.
 
-이 프로젝트는 다음 두 가지를 동시에 보여주는 것을 목표로 합니다.
+먼저 모의 Threat Intelligence 데이터를 생성합니다. AbuseIPDB·VirusTotal·OTX 같은 외부 소스를 흉내 내서, `indicator(IP 주소)`, `threat_type`, `source`, `base_score`, `first_seen` 등의 필드를 가진 테이블을 만들어 둡니다. 이 데이터는 실제 TI Feed의 구조를 본떠서 설계했고, 점수(`base_score`)는 악성 IP가 보통 가지는 평판 점수를 가정해 1~100 범위에서 난수 기반으로 구성했습니다. 이후 이 IOC 목록을 정규화하면서 IP 포맷, 대소문자, 공백, null 값 등을 맞춰줘서 나중에 로그와 매칭될 때 문제가 없도록 합니다.
 
-1. **실전 보안 관제(SOC)·Incident Response에서 사용하는 Threat Intelligence 활용能力**
-2. **보안 로그를 데이터 파이프라인 관점에서 설계하고 자동화하는 엔지니어링 능력**
+보안 로그 쪽은 따로 생성한 Spark 기반 로그 프로젝트와 동일한 철학으로, `src_ip`, `dst_ip`가 모두 문자열 형태로 정리된 상태입니다. 여기서 핵심은 `src_ip`와 `dst_ip`를 각각 IOC 테이블과 조인해서 **“이 IP가 공격자 쪽인지, 피해자 쪽인지, 또는 두 경우 모두인지”** 를 구분하는 것입니다. 두 방향 매칭을 모두 수행한 뒤, 실제로 IOC에 걸린 이벤트만 필터링하면, 평범한 로그 수천 건 중에서도 위험 신호만 뽑아 볼 수 있습니다.
 
----
+다음 단계는 단순 매칭을 넘어서 **위협 점수화(threat scoring)** 를 적용하는 부분입니다. IOC에서 제공된 `base_score`를 기본값으로 삼고, 여기에 로그 자체에서 얻을 수 있는 요소들을 추가로 고려합니다. 예를 들어 한 IP가 등장한 이벤트 수(`event_count`)가 많을수록, 그리고 로그 발생 시점이 최신일수록 위험도가 더 높다고 보고, 지수 감쇠 기반의 “최근성 가중치(recency weight)”를 계산해 점수에 반영했습니다. 최종 스코어는 `base_score`, `event_count`, `recency_weight`를 조합해서 만들었고, 그 결과를 내림차순으로 정렬하면 “현재 로그에서 가장 위험하게 움직인 IP Top N”을 바로 확인할 수 있습니다. 분석 결과는 CSV로 저장하고, 상위 IP는 막대 그래프로 가볍게 시각화해서 직관적으로 파악할 수 있게 했습니다.
 
-## 🔧 주요 기능 (Key Features)
-
-### 1. 보안 로그(synthetic) 자동 생성
-- 실제 방화벽/서버 로그 포맷을 모방한 샘플 데이터 생성
-- 필드 예시:
-  - `event_time`, `src_ip`, `dst_ip`, `src_port`, `dst_port`
-  - `protocol`, `action`, `bytes_sent`, `bytes_received`
-- 일부 트래픽에 공격 패턴(포트 스캔/브루트포스 느낌)을 섞어서 **위협 분석 시나리오**를 만들도록 설계
-
-### 2. Threat Intelligence(IOC) 모의 데이터 생성
-- 실제 TI Feed 형식을 참고한 **위협 IP 리스트** 생성
-- 필드 예시:
-  - `indicator` (IP 주소)
-  - `indicator_type` (ipv4)
-  - `threat_type` (예: C2 Server, Brute Force, Malware Hosting 등)
-  - `source` (AbuseIPDB, VirusTotal, OTX, Internal-IR 등)
-  - `base_score` (1~100 사이 위협 점수)
-  - `first_seen` (처음 관측된 날짜)
-
-### 3. IOC 정규화(Normalization)
-- indicator/IP 문자열을 소문자/공백 제거 등으로 **형식 통일**
-- `indicator_type`, `threat_type`, `source` 정리
-- `base_score` 결측치 처리 (기본값 50)
-
-### 4. 보안 로그 ↔ IOC 자동 매칭
-- `src_ip`, `dst_ip` 기준으로 **위협 IP와 조인**
-- 한 이벤트가 “공격자/피해자” 양쪽에서 등장할 수 있도록
-  - `src_ip_norm` 기준 매칭
-  - `dst_ip_norm` 기준 매칭
-- 두 결과를 합쳐서 **IOC에 걸린 이벤트만 필터링**
-
-### 5. 위협 점수(Threat Score) 계산
-IP 단위로 다음 요소를 활용해 최종 점수를 계산합니다.
-
-- TI에서 제공하는 `base_score` (기본 위협도)
-- 해당 IP와 매칭된 **이벤트 수(event_count)**
-- 최근 발생한 이벤트일수록 더 높은 점수를 주는 **최근성(recency_weight)**
-
-공식(예시):
-
-\[
-\text{final_score} 
-= 0.6 \times \text{base\_score}
-+ 15 \times \log(1 + \text{event\_count})
-+ 25 \times \text{recency\_weight}
-\]
-
-### 6. 고위험 IP 랭킹 & 리포트 저장
-- `final_score` 기준으로 내림차순 정렬
-- 상위 고위험 IP를 콘솔에 출력
-- 전체 결과를 `outputs/threat_summary.csv` 로 저장
-- Top 10 IP에 대해 **막대 그래프 시각화**까지 지원
-
----
-
-## 🧱 기술 스택 (Tech Stack)
-
-- **Language**: Python 3
-- **Data Processing**: pandas, numpy
-- **Visualization**: matplotlib
-- **(Optional) Threat Intelligence API 연동**:
-  - VirusTotal IP Report API v3 예시 코드 포함
-  - 실제 사용 시 API Key만 넣으면 바로 확장 가능
-
-> 💡 이 레포는 **모의 TI 데이터로도 완전히 동작**하도록 설계되어 있어서,  
-> API Key가 없어도 파이프라인 자체는 끝까지 돌아갑니다.
-
----
-
-## 📂 프로젝트 구조 (권장)
-
-```bash
-project-root/
-├── README.md
-├── ti_ioc_pipeline_colab.py   # (선택) Colab 코드 백업용
-└── outputs/
-    └── threat_summary.csv     # 실행 후 생성됨
+전체 코드는 Google Colab 기준으로 설계되어 있어 별도의 환경 설정이 필요 없고, 기본적으로 모의 TI 데이터를 사용하기 때문에 API Key 없이도 전체 파이프라인이 끝까지 동작합니다. 원한다면 VirusTotal API를 붙여서 실제 평판 정보를 사용할 수도 있도록 샘플 함수도 포함해 두었습니다. 이 프로젝트는 “보안 로그 처리”와 “Threat Intelligence 활용”을 자연스럽게 잇는 형태라, 단순 이상치 탐지보다 실전 보안 관제에 가까운 흐름을 담고 있습니다. 실제 SOC에서 수행하는 IOC 분석→로그 매칭→위협 수준 계산의 축소판이라고 보시면 됩니다.
