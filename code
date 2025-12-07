@@ -1,0 +1,341 @@
+import os
+import json
+from datetime import datetime, timedelta
+import random
+
+import pandas as pd
+import numpy as np
+
+# 시각화 (옵션)
+import matplotlib.pyplot as plt
+
+print("✅ 환경 준비 완료 (pandas / numpy / matplotlib 불러옴)")
+
+# ===============================
+# 2. 설정값 (사용자 수정 구간)
+# ===============================
+
+# [옵션] Threat Intelligence API Key 설정 (원할 때만 사용)
+# 예시로 VirusTotal을 보여주지만, 기본 파이프라인은 '모의 TI 데이터'로도 완전히 동작합니다.
+VT_API_KEY = os.environ.get("VT_API_KEY", "")  # 필요 시 Colab에서 환경변수로 설정
+
+# 로그/보고서 저장 경로
+OUTPUT_DIR = "./outputs"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"✅ 결과 저장 폴더: {OUTPUT_DIR}")
+
+# ===============================
+# 3. 보안 로그 샘플 데이터 생성
+# ===============================
+
+def generate_synthetic_logs(n_rows: int = 5000, seed: int = 42) -> pd.DataFrame:
+    """보안 로그 형태의 모의 데이터 생성.
+    실제 방화벽 / 서버 로그 느낌을 살린 필드 구성.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    base_time = datetime.utcnow()
+    rows = []
+
+    internal_subnets = ["10.0.0.", "10.0.1.", "192.168.0.", "172.16.0."]
+
+    for i in range(n_rows):
+        event_time = base_time - timedelta(seconds=i * random.randint(1, 5))
+        src_ip = random.choice(internal_subnets) + str(random.randint(1, 254))
+        dst_ip = f"{random.randint(1, 255)}.{random.randint(0, 255)}.{random.randint(0, 255)}.{random.randint(1, 254)}"
+
+        src_port = random.randint(1024, 65535)
+        dst_port = random.choice([22, 80, 80, 80, 443, 443, 3389, 8080, 5432])
+
+        proto = random.choice(["TCP", "TCP", "TCP", "UDP"])
+        action = random.choice(["ALLOW", "ALLOW", "ALLOW", "DENY"])
+
+        bytes_sent = max(40, int(np.random.lognormal(mean=7, sigma=1)))
+        bytes_received = max(40, int(np.random.lognormal(mean=7, sigma=1)))
+
+        # 약간의 공격 패턴 섞기: 특정 IP를 공격자로 설정
+        if random.random() < 0.02:  # 2% 정도는 스캔/공격 느낌
+            dst_port = random.choice([22, 23, 445, 1433, 3306])
+            action = random.choice(["DENY", "DENY", "ALLOW"])
+
+        rows.append(
+            {
+                "event_time": event_time.isoformat() + "Z",
+                "src_ip": src_ip,
+                "dst_ip": dst_ip,
+                "src_port": src_port,
+                "dst_port": dst_port,
+                "protocol": proto,
+                "action": action,
+                "bytes_sent": bytes_sent,
+                "bytes_received": bytes_received,
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+logs_df = generate_synthetic_logs(n_rows=5000)
+print("✅ 보안 로그 샘플 생성 완료:", logs_df.shape)
+print(logs_df.head())
+
+# ===============================
+# 4. 모의 Threat Intelligence(IOC) 데이터 생성
+# ===============================
+
+def generate_synthetic_ti(num_rows: int = 300, seed: int = 123) -> pd.DataFrame:
+    """IOC(Indicator of Compromise) 모의 데이터 생성.
+    실제 Threat Intelligence Feed를 흉내낸 구조.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+
+    indicators = []
+    # 악성 IP 일부는 로그에 등장하도록 내부/외부 대역 섞기
+    malicious_subnets = ["10.0.0.", "10.0.1.", "45.83.12.", "185.23.44.", "222.122."]
+
+    threat_types = [
+        "C2 Server",
+        "Brute Force",
+        "Port Scan",
+        "Malware Hosting",
+        "Phishing",
+        "Botnet",
+    ]
+    sources = ["AbuseIPDB", "VirusTotal", "OTX", "Internal-IR", "ET-Open"]
+
+    for i in range(num_rows):
+        subnet = random.choice(malicious_subnets)
+        ip = subnet + str(random.randint(1, 254))
+
+        threat_type = random.choice(threat_types)
+        source = random.choice(sources)
+        base_score = round(np.clip(np.random.normal(loc=70, scale=20), 1, 100), 1)
+
+        indicators.append(
+            {
+                "indicator": ip,
+                "indicator_type": "ipv4",
+                "threat_type": threat_type,
+                "source": source,
+                "base_score": base_score,
+                "first_seen": (datetime.utcnow() - timedelta(days=random.randint(1, 60))).date().isoformat(),
+            }
+        )
+
+    ti_df = pd.DataFrame(indicators)
+    return ti_df
+
+
+ti_df = generate_synthetic_ti()
+print("✅ 모의 Threat Intelligence 데이터 생성 완료:", ti_df.shape)
+print(ti_df.head())
+
+# ===============================
+# 5. IOC 정규화 / 전처리
+# ===============================
+
+def normalize_ioc_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    """IOC 데이터 정규화: 공백/대소문자/형식 통일 등."""
+    df = df.copy()
+    df["indicator"] = df["indicator"].astype(str).str.strip().str.lower()
+    df["indicator_type"] = df["indicator_type"].str.lower()
+    df["threat_type"] = df["threat_type"].str.strip()
+    df["source"] = df["source"].str.strip()
+    # base_score가 없는 경우 기본값 50
+    df["base_score"] = df["base_score"].fillna(50.0)
+    return df
+
+
+ti_df_norm = normalize_ioc_dataframe(ti_df)
+print("✅ IOC 정규화 완료")
+
+# ===============================
+# 6. 로그와 IOC 매칭 (src_ip / dst_ip 기준)
+# ===============================
+
+def match_logs_with_iocs(logs: pd.DataFrame, iocs: pd.DataFrame) -> pd.DataFrame:
+    """로그의 src_ip, dst_ip를 IOC indicator(ipv4)와 매칭.
+    - 왼쪽: logs
+    - 오른쪽: IOC
+    두 방향(src/dst)에 대해 각각 join 후 union.
+    """
+    logs = logs.copy()
+    iocs = iocs.copy()
+
+    # 정규화: IP 문자열 형태 통일
+    logs["src_ip_norm"] = logs["src_ip"].astype(str).str.strip().str.lower()
+    logs["dst_ip_norm"] = logs["dst_ip"].astype(str).str.strip().str.lower()
+
+    ipv4_iocs = iocs[iocs["indicator_type"] == "ipv4"].copy()
+    ipv4_iocs.rename(columns={"indicator": "ip_norm"}, inplace=True)
+
+    # src_ip 기준 조인
+    src_merged = logs.merge(
+        ipv4_iocs,
+        left_on="src_ip_norm",
+        right_on="ip_norm",
+        how="left",
+        suffixes=("", "_ioc"),
+    )
+    src_merged["matched_side"] = np.where(src_merged["ip_norm"].notna(), "src_ip", None)
+
+    # dst_ip 기준 조인
+    dst_merged = logs.merge(
+        ipv4_iocs,
+        left_on="dst_ip_norm",
+        right_on="ip_norm",
+        how="left",
+        suffixes=("", "_ioc"),
+    )
+    dst_merged["matched_side"] = np.where(dst_merged["ip_norm"].notna(), "dst_ip", None)
+
+    # 두 결과를 concat
+    combined = pd.concat([src_merged, dst_merged], ignore_index=True)
+
+    # 매칭되지 않은 행 제거 (ip_norm이 NaN인 경우)
+    combined = combined[combined["ip_norm"].notna()].copy()
+
+    print("✅ 로그-IOC 매칭 완료. 매칭된 이벤트 수:", combined.shape[0])
+    return combined
+
+
+matched_df = match_logs_with_iocs(logs_df, ti_df_norm)
+print(matched_df.head())
+
+# ===============================
+# 7. 위협 스코어링 로직
+# ===============================
+
+def compute_threat_scores(matched_logs: pd.DataFrame) -> pd.DataFrame:
+    """매칭된 로그 기반으로 IP별 최종 위협 점수 계산.
+    - base_score (TI)
+    - 이벤트 수
+    - 최근성(최근 이벤트 가중치)
+    """
+    if matched_logs.empty:
+        print("⚠️ 매칭된 로그가 없습니다. 스코어링을 수행할 수 없습니다.")
+        return pd.DataFrame()
+
+    df = matched_logs.copy()
+
+    # event_time을 datetime으로 파싱
+    df["event_time_parsed"] = pd.to_datetime(df["event_time"], errors="coerce")
+
+    # 기준 시간: 데이터 내 최댓값
+    max_time = df["event_time_parsed"].max()
+
+    # 최근성 점수: 최근일수록 점수가 높도록 (0~1)
+    df["recency_days"] = (max_time - df["event_time_parsed"]).dt.total_seconds() / 86400.0
+    df["recency_weight"] = np.exp(-df["recency_days"] / 7.0)  # 1주 기준 지수감쇠
+
+    # IP 별 집계 (공격 IP: ip_norm 기준)
+    agg = (
+        df.groupby("ip_norm")
+        .agg(
+            {
+                "base_score": "max",          # TI에서 온 base score
+                "recency_weight": "mean",     # 최근성 평균
+                "event_time_parsed": "count", # 이벤트 수
+                "threat_type": lambda x: list(sorted(set(x))),
+                "source": lambda x: list(sorted(set(x))),
+            }
+        )
+        .rename(columns={"event_time_parsed": "event_count"})
+        .reset_index()
+    )
+
+    # 최종 스코어 계산
+    # final_score = base_score * 0.6 + log(event_count+1)*15 + recency_weight*25
+    agg["log_event_factor"] = np.log1p(agg["event_count"])
+    agg["final_score"] = (
+        agg["base_score"] * 0.6
+        + agg["log_event_factor"] * 15.0
+        + agg["recency_weight"] * 25.0
+    )
+
+    agg.sort_values("final_score", ascending=False, inplace=True)
+
+    print("✅ 위협 스코어 계산 완료. 고위험 IP 상위 5개:")
+    print(agg[["ip_norm", "final_score", "base_score", "event_count"]].head())
+
+    return agg
+
+
+threat_summary_df = compute_threat_scores(matched_df)
+
+# ===============================
+# 8. 보고서 저장 & 간단한 시각화
+# ===============================
+
+if not threat_summary_df.empty:
+    summary_path = os.path.join(OUTPUT_DIR, "threat_summary.csv")
+    threat_summary_df.to_csv(summary_path, index=False)
+    print(f"✅ 위협 요약 보고서 저장 완료: {summary_path}")
+
+    top10 = threat_summary_df.head(10)
+
+    plt.figure(figsize=(10, 5))
+    plt.bar(top10["ip_norm"], top10["final_score"])
+    plt.xticks(rotation=45, ha="right")
+    plt.ylabel("Final Threat Score")
+    plt.title("Top 10 Malicious IPs (Synthetic TI)")
+    plt.tight_layout()
+    plt.show()
+else:
+    print("⚠️ 스코어링 결과가 비어 있어 저장/시각화를 건너뜁니다.")
+
+# ===============================
+# 9. [선택] 실제 VirusTotal API 통합 예시 코드
+# ===============================
+import time
+import requests
+
+def query_virustotal_ip(ip: str, api_key: str) -> dict:
+    """VirusTotal IP Report API v3 호출 예시.
+    - 실제 사용 시에는 colab 환경에서 VT_API_KEY 환경변수 설정 필요.
+    - 여기서는 구조만 제공 (API 키 없으면 호출하지 않도록 설계)
+    """
+    if not api_key:
+        raise ValueError("VirusTotal API Key가 설정되어 있지 않습니다. VT_API_KEY를 환경변수로 설정하세요.")
+
+    url = f"https://www.virustotal.com/api/v3/ip_addresses/{ip}"
+    headers = {
+        "x-apikey": api_key.strip()
+    }
+    resp = requests.get(url, headers=headers, timeout=10)
+    if resp.status_code != 200:
+        raise RuntimeError(f"VirusTotal API 호출 실패: status={resp.status_code}, body={resp.text[:200]}")
+    data = resp.json()
+    return data
+
+def vt_reputation_score_from_response(data: dict) -> float:
+    """VirusTotal 응답에서 악성/의심/정상 카운트를 이용해 간단한 평판 점수 계산."""
+    stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+    malicious = stats.get("malicious", 0)
+    suspicious = stats.get("suspicious", 0)
+    harmless = stats.get("harmless", 0)
+    undetected = stats.get("undetected", 0)
+
+    total = malicious + suspicious + harmless + undetected
+    if total == 0:
+        return 0.0
+
+    score = (malicious * 1.0 + suspicious * 0.5) / total * 100.0
+    return round(score, 1)
+
+def enrich_single_ip_with_vt(ip: str, api_key: str) -> dict:
+    """단일 IP에 대해 VT 평판 정보를 조회하고 핵심 값만 정리."""
+    data = query_virustotal_ip(ip, api_key)
+    score = vt_reputation_score_from_response(data)
+    return {
+        "ip": ip,
+        "vt_score": score,
+        "raw": data,
+    }
+
+print("✅ 모의 TI 파이프라인 실행 완료.")
+print("ℹ️ 실제 VirusTotal 통합은 VT_API_KEY를 설정한 뒤 enrich_single_ip_with_vt(ip, VT_API_KEY)를 호출해서 사용하세요.")
